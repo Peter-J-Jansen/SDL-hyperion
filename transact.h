@@ -25,6 +25,11 @@
 #define  MAX_TXF_PAGES         1024   /* Max num of modified pages   */
                                       /* (z15 = 4MB L2 Data Cache )  */
 
+#if defined( TXF_BACKOUT_METHOD )
+  #define TXF_BACKOUT_CACHE_LINES_MAX 1024       /* Arbitrary number */
+  #define ZCACHE_LINE_ADDRMASK        0xFFFFFFFFFFFFFF00ULL
+#endif /* defined( TXF_BACKOUT_METHOD ) */
+
 #define  ZPAGEFRAME_PAGESIZE   4096   /* IBM z page size (4K)        */
 #define  ZPAGEFRAME_BYTEMASK   0x00000FFF
 #define  ZPAGEFRAME_PAGEMASK   0xFFFFFFFFFFFFF000ULL
@@ -80,6 +85,201 @@ struct TPAGEMAP
 #define CM_STORED   2           /* cache line was stored into        */
 };
 typedef struct TPAGEMAP  TPAGEMAP;   // Transaction Page Map table
+
+#if defined( TXF_BACKOUT_METHOD )
+
+/*-------------------------------------------------------------------*/
+/*                Transaction Backout Cache Lines                    */
+/*-------------------------------------------------------------------*/
+  struct TXF_BACKOUT_CACHE_LINES
+  {
+      BYTE*   maddr;               /* address of mainstor cache line */
+      BYTE*   backout_cache_line;  /* address of backout  cache line */
+  };
+  typedef struct TXF_BACKOUT_CACHE_LINES TXF_BACKOUT_CACHE_LINES;
+
+  #define TXF_NONTRANSACTIONAL_ACCESS( regs, arn )                                            \
+     (0                                                                                       \
+     || !(regs)                                                                               \
+     || !(regs)->txf_tnd                                                                      \
+     || (arn) == USE_INST_SPACE    /* Instruction fetching */                                 \
+     || (arn) == USE_REAL_ADDR     /* Address translation  */                                 \
+        /* SA22-7832-12 Principles of Operation, page 5-99:                                   \
+                                                                                              \
+             "Storage accesses for instruction and DAT- and ART-                              \
+              table fetches follow the non-transactional rules."                              \
+        */                                                                                    \
+     || (regs)->txf_NTSTG)
+
+  #define TXF_PAGE_CACHE_LINES_STATUS_2( maddr )                                              \
+      ( sysblk.txf_page_cache_lines_status[                                                   \
+              ( (U64) ( (maddr) - sysblk.mainstor ) ) >> SHIFT_4K ] )
+//    ( sysblk.txf_page_cache_lines_status[ ( (U64) (maddr) ) >> SHIFT_4K ] )
+  #define TXF_PAGE_CACHE_LINES_STATUS( maddr )                                                \
+      ( *( sysblk.txf_page_cache_lines_status                                                 \
+          + ( ( (U64) ( (maddr) - sysblk.mainstor ) ) >> SHIFT_4K ) ) )
+//    ( *( sysblk.txf_page_cache_lines_status + ( ( (U64) (maddr) ) >> SHIFT_4K ) ) )
+  #define TXF_PAGE_CACHE_LINES_STATUS_OFFSET_LEFT( maddr )                                    \
+      (            ( ( (U64) (maddr) )                                                        \
+      & 0x0F00 )   >> ( ZCACHE_LINE_SHIFT - 1 ) )
+  #define TXF_PAGE_CACHE_LINES_STATUS_OFFSET_RIGHT( maddr, len ) ( 30 -                       \
+      (   (    MIN ( ( (U64) (maddr) & ZPAGEFRAME_BYTEMASK ) + (len),                         \
+                                       ZPAGEFRAME_BYTEMASK )                                  \
+      & 0x0F00 )   >> ( ZCACHE_LINE_SHIFT - 1 ) ) )
+  #define TXF_PAGE_CACHE_LINES_STATUS_SIZE( maddr, len )         (  1 +                       \
+      ( ( (    MIN ( ( (U64) (maddr) & ZPAGEFRAME_BYTEMASK ) + (len),                         \
+                                       ZPAGEFRAME_BYTEMASK )                                  \
+      & 0x0F00 ) - ( ( (U64) (maddr) )                                                        \
+      & 0x0F00 ) ) >>   ZCACHE_LINE_SHIFT     ) )
+  #define TXF_PAGE_CACHE_LINES_STATUS_MASK( maddr, len )                                      \
+      ( ( 0xFFFFFFFF                                                                          \
+      << ( TXF_PAGE_CACHE_LINES_STATUS_OFFSET_RIGHT( (maddr), (len) ) +                       \
+           TXF_PAGE_CACHE_LINES_STATUS_OFFSET_LEFT ( (maddr) ) ) )                            \
+      >> ( TXF_PAGE_CACHE_LINES_STATUS_OFFSET_LEFT ( (maddr) ) ) )
+  #define TXF_PAGE_CACHE_LINES_STATUS_MADDRL( maddr, len )                                    \
+      ( TXF_PAGE_CACHE_LINES_STATUS( (maddr) )                                                \
+      & TXF_PAGE_CACHE_LINES_STATUS_MASK( maddr, len ) )
+  #define TXF_PAGE_CACHE_LINES_STATUS_TO_MERGE( maddr, len, acctype )                         \
+      ( TXF_PAGE_CACHE_LINES_STATUS_MASK( (maddr), (len) ) &                                  \
+          ( ( TXF_ACCTYPE( (acctype) ) & ACC_WRITE )                                          \
+          ? TXF_PAGE_CACHE_LINES_STATUS_STORED |                                              \
+            TXF_PAGE_CACHE_LINES_STATUS_ACCESSED                                              \
+          : TXF_PAGE_CACHE_LINES_STATUS_ACCESSED ) )
+  #define TXF_PUT_PAGE_CACHE_LINES_STATUS( maddr, len, acctype )                              \
+      TXF_PAGE_CACHE_LINES_STATUS( (maddr) ) =                                                \
+      TXF_PAGE_CACHE_LINES_STATUS_TO_MERGE( (maddr), (len), (acctype) ) ;
+
+  #define TXF_MERGE_PAGE_CACHE_LINES_STATUS( maddr, len, acctype )                            \
+      /* MAINLOCK may be required if cmpxchg assists unavailable */                           \
+      OBTAIN_MAINLOCK( regs );                                                                \
+      {                                                                                       \
+      /*  U32 old = 0; */                                                                     \
+          while ( cmpxchg4( &old, old |                                                       \
+              TXF_PAGE_CACHE_LINES_STATUS_TO_MERGE( (maddr), (len), (acctype) ),              \
+              &TXF_PAGE_CACHE_LINES_STATUS( (maddr) ) ) ) {};                                 \
+      }                                                                                       \
+      RELEASE_MAINLOCK( regs );
+
+  #define TXF_BACKOUT_CACHE_LINE_INDEX( _regs, _maddr, _index  )                              \
+      do {                                                                                    \
+          (_index) = (_regs)->txf_backout_cache_lines_count;                                  \
+          for ( i = 0;                                                                        \
+                i < (_index)                                    &&                            \
+                ( (_regs)->txf_backout_cache_lines[ i ].maddr ) &&                            \
+                ( (U64) (_regs)->txf_backout_cache_lines[ i ].maddr >> ZCACHE_LINE_SHIFT ) != \
+                ( (U64) (_maddr)                                    >> ZCACHE_LINE_SHIFT );   \
+                i++ ) {}                                                                      \
+          (_index) = ( i < (_index) ) ? i : -1;                                               \
+      } while(0)
+
+  #define TXF_BACKOUT_CACHE_LINE( _regs, _maddr, _bcl_index  )                                \
+      do {                                                                                    \
+          BYTE* backout_maddr = NULL;                                                         \
+          U32   backout_page_cache_lines = 0;                                                 \
+          int i;                                                                              \
+          if ( (_maddr) ) /* _maddr != NULL : search regs->txf_backout_cache_lines[*]  */     \
+          {                                                                                   \
+              (_bcl_index) = (_regs)->txf_backout_cache_lines_count;                          \
+              for ( i = 0;                                                                    \
+                    i < (_bcl_index)                                &&                        \
+                    ( (_regs)->txf_backout_cache_lines[ i ].maddr ) &&                        \
+                    ( ( (U64) (_maddr) >> ZCACHE_LINE_SHIFT ) !=                              \
+                      ( (U64) (_regs)->txf_backout_cache_lines[ i ].maddr                     \
+                                       >> ZCACHE_LINE_SHIFT ) );                              \
+                    i++ ) {}                                                                  \
+              (_bcl_index) = ( i < (_bcl_index) ) ? i : -1;                                   \
+          }                                                                                   \
+          else                                                                                \
+          {                                                                                   \
+                                                                                              \
+          }                                                                                   \
+                                                                                              \
+                                                                                              \
+                                                                                              \
+          while ( cmpxchg4( &backout_maddr, backout_maddr,                                    \
+              (_regs)->txf_backout_cache_lines[ (_bcl_index) ].maddr ) {};                    \
+          if ( backout_maddr )                                                                \
+          {                                                                                   \
+              cmpxchg4( &backout_page_cache_lines, backout_page_cache_lines &                 \
+                  ^TXF_PAGE_CACHE_LINES_STATUS_TO_MERGE( backout_maddr, 1, ACC_WRITE ),       \
+                  &TXF_PAGE_CACHE_LINES_STATUS( backout_maddr ) ) {};                         \
+              if ( backout_page_cache_lines &                                                 \
+                   TXF_PAGE_CACHE_LINES_STATUS_MASK( backout_maddr, 1) ==                     \
+                   TXF_PAGE_CACHE_LINES_STATUS_MASK( backout_maddr, 1) )                      \
+              {                                                                               \
+                  memcpy( backout_maddr,                                                      \
+                      (_regs)->txf_backout_cache_lines[ (_bcl_index) ].backout_cache_line,    \
+                      ZCACHE_LINE_SIZE);                                                      \
+              }                                                                               \
+          }                                                                                   \
+      } while(0)
+
+
+  #if 0
+  #define TYF_PAGE_CACHE_LINES_STATUS( maddr )                                 \
+      (    sysblk.txf_page_cache_lines_status + ( ( (U64) (maddr) ) >> SHIFT_4K )   )
+  #define TXF_PAGE_CACHE_LINES_STATUS_OFFSET_LOFT( maddr )                     \
+      (       ( ( (U64) (maddr) )                                              \
+               )                              )
+  #define TXF_PAGE_CACHE_LINES_STATUS_OFFSET_ROGHT( maddr, len )               \
+      ( ( MIN ( ( (U64) (maddr) & ZPAGEFRAME_BYTEMASK ) + (len),               \
+                                  ZPAGEFRAME_BYTEMASK )                        \
+               )                              )
+  #define TYF_CACHE_LINES_STATUS_PAGE_OFFSET_FIRST( maddr )                   \
+      ( ( ( 0xFFFFFFFF )                                                      \
+      >> ZCACHE_LINE_SHIFT ) && 0xF )
+  #define TYF_CACHE_LINES_STATUS_PAGE_OFFSET_LAST( maddr, len )               \
+      ( 15 - ( ( 0xFFFFFFFF )                                                 \
+      >> ZCACHE_LINE_SHIFT ) && 0xF )
+  #define TXF_PAGE_CACHE_LINES_STATUS_MODDRL( maddr, len )                     \
+      ( TXF_PAGE_CACHE_LINES_STATUS( (maddr) ) &                               \
+      ( ( 0xFFFFFFFF                                                           \
+      << ( TXF_PAGE_CACHE_LINES_STATUS_OFFSET_RIGHT( (maddr), (len) ) +        \
+           TXF_PAGE_CACHE_LINES_STATUS_OFFSET_LEFT ( (maddr) ) ) )             \
+      >> ( TXF_PAGE_CACHE_LINES_STATUS_OFFSET_LEFT ( (maddr) ) ) ) )
+
+/**********************************************************************/
+/* TXF_CACHE_LINE_MASKS selects up to 16 cache line elements with the */
+/* leftmost starting at a 4K page OFFSET (1st index) for LENGTH bytes */
+/* (2nd index), up to a maximum of 4K bytes = 16 cache lines.         */
+/**********************************************************************/
+static const U32 txf_cache_line_mask[16][16] = {
+    { 0xC0000000, 0xF0000000, 0xFC000000, 0xFF000000, 0xFFC00000, 0xFFF00000, 0xFFFC0000, 0xFFFF0000,
+      0xFFFFC000, 0xFFFFF000, 0xFFFFFC00, 0xFFFFFF00, 0xFFFFFFC0, 0xFFFFFFF0, 0xFFFFFFFC, 0xFFFFFFFF } ,
+    { 0xC0000000, 0xF0000000, 0xFC000000, 0xFF000000, 0xFFC00000, 0xFFF00000, 0xFFFC0000, 0xFFFF0000,
+      0xFFFFC000, 0xFFFFF000, 0xFFFFFC00, 0xFFFFFF00, 0xFFFFFFC0, 0xFFFFFFF0, 0xFFFFFFFC, 0xFFFFFFFF } ,
+    { 0xC0000000, 0xF0000000, 0xFC000000, 0xFF000000, 0xFFC00000, 0xFFF00000, 0xFFFC0000, 0xFFFF0000,
+      0xFFFFC000, 0xFFFFF000, 0xFFFFFC00, 0xFFFFFF00, 0xFFFFFFC0, 0xFFFFFFF0, 0xFFFFFFFC, 0xFFFFFFFF } ,
+    { 0xC0000000, 0xF0000000, 0xFC000000, 0xFF000000, 0xFFC00000, 0xFFF00000, 0xFFFC0000, 0xFFFF0000,
+      0xFFFFC000, 0xFFFFF000, 0xFFFFFC00, 0xFFFFFF00, 0xFFFFFFC0, 0xFFFFFFF0, 0xFFFFFFFC, 0xFFFFFFFF } ,
+    { 0xC0000000, 0xF0000000, 0xFC000000, 0xFF000000, 0xFFC00000, 0xFFF00000, 0xFFFC0000, 0xFFFF0000,
+      0xFFFFC000, 0xFFFFF000, 0xFFFFFC00, 0xFFFFFF00, 0xFFFFFFC0, 0xFFFFFFF0, 0xFFFFFFFC, 0xFFFFFFFF } ,
+    { 0xC0000000, 0xF0000000, 0xFC000000, 0xFF000000, 0xFFC00000, 0xFFF00000, 0xFFFC0000, 0xFFFF0000,
+      0xFFFFC000, 0xFFFFF000, 0xFFFFFC00, 0xFFFFFF00, 0xFFFFFFC0, 0xFFFFFFF0, 0xFFFFFFFC, 0xFFFFFFFF } ,
+    { 0xC0000000, 0xF0000000, 0xFC000000, 0xFF000000, 0xFFC00000, 0xFFF00000, 0xFFFC0000, 0xFFFF0000,
+      0xFFFFC000, 0xFFFFF000, 0xFFFFFC00, 0xFFFFFF00, 0xFFFFFFC0, 0xFFFFFFF0, 0xFFFFFFFC, 0xFFFFFFFF } ,
+    { 0xC0000000, 0xF0000000, 0xFC000000, 0xFF000000, 0xFFC00000, 0xFFF00000, 0xFFFC0000, 0xFFFF0000,
+      0xFFFFC000, 0xFFFFF000, 0xFFFFFC00, 0xFFFFFF00, 0xFFFFFFC0, 0xFFFFFFF0, 0xFFFFFFFC, 0xFFFFFFFF } ,
+    { 0xC0000000, 0xF0000000, 0xFC000000, 0xFF000000, 0xFFC00000, 0xFFF00000, 0xFFFC0000, 0xFFFF0000,
+      0xFFFFC000, 0xFFFFF000, 0xFFFFFC00, 0xFFFFFF00, 0xFFFFFFC0, 0xFFFFFFF0, 0xFFFFFFFC, 0xFFFFFFFF } ,
+    { 0xC0000000, 0xF0000000, 0xFC000000, 0xFF000000, 0xFFC00000, 0xFFF00000, 0xFFFC0000, 0xFFFF0000,
+      0xFFFFC000, 0xFFFFF000, 0xFFFFFC00, 0xFFFFFF00, 0xFFFFFFC0, 0xFFFFFFF0, 0xFFFFFFFC, 0xFFFFFFFF } ,
+    { 0xC0000000, 0xF0000000, 0xFC000000, 0xFF000000, 0xFFC00000, 0xFFF00000, 0xFFFC0000, 0xFFFF0000,
+      0xFFFFC000, 0xFFFFF000, 0xFFFFFC00, 0xFFFFFF00, 0xFFFFFFC0, 0xFFFFFFF0, 0xFFFFFFFC, 0xFFFFFFFF } ,
+    { 0xC0000000, 0xF0000000, 0xFC000000, 0xFF000000, 0xFFC00000, 0xFFF00000, 0xFFFC0000, 0xFFFF0000,
+      0xFFFFC000, 0xFFFFF000, 0xFFFFFC00, 0xFFFFFF00, 0xFFFFFFC0, 0xFFFFFFF0, 0xFFFFFFFC, 0xFFFFFFFF } ,
+    { 0xC0000000, 0xF0000000, 0xFC000000, 0xFF000000, 0xFFC00000, 0xFFF00000, 0xFFFC0000, 0xFFFF0000,
+      0xFFFFC000, 0xFFFFF000, 0xFFFFFC00, 0xFFFFFF00, 0xFFFFFFC0, 0xFFFFFFF0, 0xFFFFFFFC, 0xFFFFFFFF } ,
+    { 0xC0000000, 0xF0000000, 0xFC000000, 0xFF000000, 0xFFC00000, 0xFFF00000, 0xFFFC0000, 0xFFFF0000,
+      0xFFFFC000, 0xFFFFF000, 0xFFFFFC00, 0xFFFFFF00, 0xFFFFFFC0, 0xFFFFFFF0, 0xFFFFFFFC, 0xFFFFFFFF } ,
+    { 0xC0000000, 0xF0000000, 0xFC000000, 0xFF000000, 0xFFC00000, 0xFFF00000, 0xFFFC0000, 0xFFFF0000,
+      0xFFFFC000, 0xFFFFF000, 0xFFFFFC00, 0xFFFFFF00, 0xFFFFFFC0, 0xFFFFFFF0, 0xFFFFFFFC, 0xFFFFFFFF } ,
+    { 0xC0000000, 0xF0000000, 0xFC000000, 0xFF000000, 0xFFC00000, 0xFFF00000, 0xFFFC0000, 0xFFFF0000,
+      0xFFFFC000, 0xFFFFF000, 0xFFFFFC00, 0xFFFFFF00, 0xFFFFFFC0, 0xFFFFFFF0, 0xFFFFFFFC, 0xFFFFFFFF } ,
+  };
+  #endif
+
+#endif /* defined( TXF_BACKOUT_METHOD ) */
 
 /*-------------------------------------------------------------------*/
 /*                  txf_maddr_l acctype values                       */

@@ -306,6 +306,18 @@ int configure_storage( U64 mainsize /* number of 4K pages */ )
     /* Add number of pages needed for our storage key array */
     storsize += skeysize;
 
+#if defined( _FEATURE_073_TRANSACT_EXEC_FACILITY )
+  #if defined( TXF_BACKOUT_METHOD )
+    /*
+     * The TXF_BACKOUT_METHOD requires 2 bits of status for each
+     * TXF cache line.  Each 4K page mainstor is 16 cache lines of
+     * 256 bytes, thus needing 4 bytes of TXF cache line status.  4K
+     * bytes of TXF cache line status supports 1K of mainsize pages.
+     */
+    storsize += ( mainsize + _1K - 1 ) >> SHIFT_1K;
+  #endif /* defined( TXF_BACKOUT_METHOD ) */
+#endif /* defined( _FEATURE_073_TRANSACT_EXEC_FACILITY ) */
+
     /* New memory is obtained only if the requested and calculated size
      * is larger than the last allocated size, or if the request is for
      * less than 2M of memory.
@@ -367,6 +379,15 @@ int configure_storage( U64 mainsize /* number of 4K pages */ )
     sysblk.storkeys = storkeys;
     sysblk.mainstor = mainstor;
     sysblk.mainsize = mainsize << SHIFT_4K;
+
+#if defined( _FEATURE_073_TRANSACT_EXEC_FACILITY )
+  #if defined( TXF_BACKOUT_METHOD )
+    /*
+     * The TXF_CACHE_LINES_STATUS is located following the MAINSTOR
+     */
+    sysblk.txf_page_cache_lines_status = ( U32* )( ( U64 )( mainstor + ( mainsize << SHIFT_4K ) ) );
+  #endif /* defined( TXF_BACKOUT_METHOD ) */
+#endif /* defined( _FEATURE_073_TRANSACT_EXEC_FACILITY ) */
 
     /*  Free previously allocated storage if no longer needed
      *

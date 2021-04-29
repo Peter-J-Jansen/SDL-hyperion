@@ -372,8 +372,10 @@ struct REGS {                           /* Processor registers       */
                                            aborted due to TAC_UPGM   */
         int     txf_aborts;             /* Abort count               */
         S32     txf_PPA;                /* PPA assistance level      */
+#if !defined( TXF_BACKOUT_METHOD )
         BYTE    txf_tnd;                /* Transaction nesting depth.
                                            Use txf_lock to access!   */
+#endif /* defined( TXF_BACKOUT_METHOD ) */
 
         BYTE    txf_ctlflag;            /* Flags for access mode
                                            change, float allowed     */
@@ -425,11 +427,39 @@ struct REGS {                           /* Processor registers       */
         TPAGEMAP  txf_pagesmap[ MAX_TXF_PAGES ]; /* Page addresses   */
         int       txf_pgcnt;            /* Entries in TPAGEMAP table */
 
+#if defined( TXF_BACKOUT_METHOD )
+        TXF_BACKOUT_CACHE_LINES
+                txf_backout_cache_lines[ TXF_BACKOUT_CACHE_LINES_MAX ];
+        int     txf_backout_cache_lines_count;   /* Entries in it    */
+        bool    txf_backout_abort_initiated;     /* Due to conflict  */
+#endif /* defined( TXF_BACKOUT_METHOD ) */
+
         BYTE    txf_gprmask;            /* GPR register restore mask */
         DW      txf_savedgr[16];        /* Saved gpr register values */
 
+#if !defined( TXF_BACKOUT_METHOD )
         int     txf_tac;                /* Transaction abort code.
                                            Use txf_lock to access!   */
+#else
+        union
+        {                               /* overlay definition for    */
+            U32    txf_tac_tnd;         /*    use in cmpxchg4( ) to  */
+            struct                      /*    avoid using txf_lock   */
+            {
+  #if !defined( WORDS_BIGENDIAN )
+                BYTE   txf_tnd;         /* Transaction nesting depth */
+                BYTE   __padding;       /* Always 0                  */
+                short  txf_tac;         /* Transaction abort         */
+  #else                                 /* E.g. on an s390x host     */
+                short  txf_tac;         /* Transaction abort         */
+                BYTE   __padding;       /* Always 0                  */
+                BYTE   txf_tnd;         /* Transaction nesting depth */
+  #endif /* !defined( WORDS_BIGENDIAN ) */
+            };
+        };
+  #define TXF_TAC_SHIFT  16             /* U32 Endian independent    */
+  #define TXF_TND_MASK   0xFF           /* U32 Endian independent    */
+#endif /* defined( TXF_BACKOUT_METHOD ) */
 
         int     txf_random_tac;         /* Random abort code         */
 
@@ -702,6 +732,20 @@ struct SYSBLK {
 atomic_update64( &sysblk.txf_stats[ contran ? 1 : 0 ].txf_ ## ctr, +1 )
 
 #define TXF_CONSTRAINED( contran ) (contran ? "CONSTRAINED" : "UNconstrained" )
+
+#if defined( TXF_BACKOUT_METHOD )
+        U16     txf_cpuad_recent;       /* cpuad of most recent TXF  */
+        U32     txf_tbegin_counter;     /* counts TBEGIN/TBEGINC but */
+                                        /* without Rubato resets     */
+        U32    *txf_page_cache_lines_status;  /* -> 16*2 bits per 4K */
+                                        /* each 2-bits meaning :     */
+#define TXF_CACHE_LINE_CLEAN    0       /* clean cache line (init)   */
+#define TXF_CACHE_LINE_STORED   1       /* cache line was stored     */
+#define TXF_CACHE_LINE_ACCESSED 2       /* cache line was accessed,  */
+                                        /*    i.e. fetched or stored */
+#define TXF_PAGE_CACHE_LINES_STATUS_ACCESSED 0xAAAAAAAA
+#define TXF_PAGE_CACHE_LINES_STATUS_STORED   0x55555555
+#endif /* defined( TXF_BACKOUT_METHOD ) */
 
 #endif /* defined( _FEATURE_073_TRANSACT_EXEC_FACILITY ) */
 

@@ -49,6 +49,18 @@
 //#define NO_OPTINST                      // Doesn't really help much?
 #define OPTION_NO_E3_OPTINST            // Problematic!
 
+#define TXF_BACKOUT_METHOD              // TXF alternative implementation
+#define TXF_COMMIT_METHOD               // TXF original implementation
+
+#if  defined( TXF_NO_BACKOUT_METHOD ) && defined( TXF_NO_COMMIT_METHOD )
+  #error Both TXF_NO_BACKOUT_METHOD and TXF_NO_COMMIT_METHOD are specified, the latter will be ignored.
+  #undef          TXF_COMMIT_METHOD
+#elif defined( TXF_NO_COMMIT_METHOD )
+  #undef          TXF_COMMIT_METHOD
+#elif defined( TXF_NO_BACKOUT_METHOD )
+  #undef          TXF_BACKOUT_METHOD
+#endif
+
 /*-------------------------------------------------------------------*/
 /*              Normal default OPTIONs and FEATUREs                  */
 /*-------------------------------------------------------------------*/

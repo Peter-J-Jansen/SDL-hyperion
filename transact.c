@@ -523,28 +523,24 @@ int         txf_backout_cache_lines_count;
         }
 
 #if defined( TXF_BACKOUT_METHOD )
-        // If a backout abort was initiated, but the above scan conflicts
-        // did not discover any, then we have disocvered a logic error.
-        // This should never occur ! However, we will try to recover from
-        // it by triggering an abort nevertheless.  And we issue a severe
-        // error message.
         if ( regs->txf_backout_abort_initiated )
         {
 
-            // Avoid looping on this logic error.
+            // Reset this indicator at TEND time.
             regs->txf_backout_abort_initiated = FALSE ;
 
-#define            HHC17741 "TXF: %s%02X: %s%s transaction failure : logic backout / commit discrepancy error discovered."
+#if 0  /* PJJ */
+            // If a backout abort was initiated, but the above scan conflicts
+            // did not discover any, then the BACKOUT method would have caused
+            // a transaction abort due to an access conflict before the COMMIT
+            // method does this at TEND time, a delayed abort.  This is not
+            // abnormal at all, and one may enable the checking and obtain
+            // HHC17741 messages to observe this behaviour.
+#define            HHC17741 "TXF: %s%02X: %s%s transaction abort using the TXF_COMMIT_METHOD would be earlier."
             WRMSG( HHC17741, "S", TXF_CPUAD( regs ), TXF_QSIE( regs ),
                 TXF_CONSTRAINED( txf_contran ) );
-
-#if 0  /* PJJ */
-            txf_tac = TAC_MISC;
-            regs->txf_why |= TXF_WHY_CONFLICT;
-            regs->txf_tnd++; // (prevent 'abort_transaction' crash)
-            ABORT_TRANS( regs, ABORT_RETRY_CC, txf_tac );
-            UNREACHABLE_CODE( return );
 #endif /* PJJ */
+
         }
 #endif /* defined( TXF_BACKOUT_METHOD ) */
 #endif /* defined( TXF_COMMIT_METHOD ) */
@@ -606,7 +602,11 @@ int         txf_backout_cache_lines_count;
         /*  We are done. Release INTLOCK and exit.  */
         /*------------------------------------------*/
 
+#if defined( TXF_COMMIT_METHOD )
         PTT_TXF( "TXF end", 0, 0, 0 );
+#else
+        PTT_TXF( "TXFB succs TEND", regs->txf_PPA, sysblk.txf_transcpus, sysblk.txf_stats[1].txf_trans );
+#endif /* defined( TXF_COMMIT_METHOD ) */
 
         /*---------------------------------------------*/
         /*          Trace failure retry success        */
@@ -647,7 +647,6 @@ int         txf_backout_cache_lines_count;
 #endif /* defined( TXF_COMMIT_METHOD ) */
 
 #if defined( TXF_BACKOUT_METHOD )
-
     // In case a transaction ends successfully, the BACKOUT method cache line status
     // bits still need to be reset, and the txf_backout_cache_line[ ].maddr set to NULL.
     txf_backout_cache_lines_count = regs->txf_backout_cache_lines_count;
@@ -660,6 +659,7 @@ int         txf_backout_cache_lines_count;
     if ( regs->txf_tnd == 0 )
         atomic_update32( &sysblk.txf_transcpus, -1 );
 
+    PTT_TXF( "TXFB done  TEND", regs->txf_PPA, sysblk.txf_transcpus, sysblk.txf_stats[1].txf_trans );
 #endif /* defined( TXF_BACKOUT_METHOD ) */
 
 } /* end DEF_INST( transaction_end ) */
@@ -837,7 +837,11 @@ VADR    effective_addr1;                /* Effective address         */
     OBTAIN_INTLOCK( regs );
     {
         /* Let our helper function do all the grunt work */
+#if defined( TXF_COMMIT_METHOD )
         PTT_TXF( "TXF TBEGINC", 0, regs->txf_contran, regs->txf_tnd );
+#else
+        PTT_TXF( "TXFB    TBEGINC", regs->txf_contran, sysblk.txf_transcpus, sysblk.txf_stats[1].txf_trans );
+#endif /* defined( TXF_COMMIT_METHOD ) */
         ARCH_DEP( process_tbegin )( true, regs, i2, 0, 0 );
     }
     RELEASE_INTLOCK( regs );
@@ -1112,7 +1116,11 @@ U32         txf_tac_tnd;
         regs->txf_pifc = MAX( regs->txf_pifc, (i2 & TXF_CTL_PIFC) );
     }
 
+#if defined( TXF_COMMIT_METHOD )
     PTT_TXF( "TXF beg", 0, regs->txf_contran, regs->txf_tnd );
+#else
+    PTT_TXF( "TXFB pro tbegin", regs->txf_tnd, sysblk.txf_transcpus, sysblk.txf_stats[1].txf_trans );
+#endif /* defined( TXF_COMMIT_METHOD ) */
 
     if (TXF_TRACE( regs, SUCCESS, regs->txf_contran ))
     {
@@ -2183,7 +2191,7 @@ static inline void txf_abort( REGS* regs, short txf_tac, U16 cpuad, int why, con
         regs->txf_who   =  cpuad;
         regs->txf_loc   =  TRIMLOC( location );
 
-        PTT_TXF( "*TXF h delay", regs->cpuad, regs->txf_contran, regs->txf_tnd );
+//PJJ   PTT_TXF( "*TXF h delay", regs->cpuad, regs->txf_contran, regs->txf_tnd );
     }
 
 } /* end function txf_abort */
@@ -2967,7 +2975,7 @@ void txf_set_timerint( bool txf_enabled_or_enabling_txf )
 /*                                                                   */
 /*-------------------------------------------------------------------*/
 DLL_EXPORT void  txf_page_cache_lines_update(                    const size_t  len,
-                                                                 REGS*         regs,
+                                             const int  arn,     REGS*         regs,
                                              const int  acctype, BYTE*         maddr )
 {
     U32     txf_page_cache_lines_status;
@@ -2979,6 +2987,52 @@ DLL_EXPORT void  txf_page_cache_lines_update(                    const size_t  l
             txf_page_cache_lines_status_not_updated,
             txf_belated_abort = FALSE;
     BYTE*   maddr_cache_line;
+
+// Copied from txf_maddr_l ; atart
+// Copied from txf_maddr_l ; atart
+// Copied from txf_maddr_l ; atart
+
+    int  txf_acctype;           /* ACC_READ or ACC_WRITE             */
+
+    /* Check if our transaction has already been aborted */
+    if (regs->txf_tac)
+    {
+        PTT_TXF( "*TXF mad TAC", regs->txf_tac, regs->txf_contran, regs->txf_tnd );
+        if (!(regs->txf_why & TXF_WHY_DELAYED_ABORT))
+        {
+            regs->txf_why  |=  TXF_WHY_DELAYED_ABORT;
+            regs->txf_who   =  regs->cpuad;
+            regs->txf_loc   =  TRIMLOC( PTT_LOC );
+        }
+        ABORT_TRANS( regs, ABORT_RETRY_CC, regs->txf_tac );
+        UNREACHABLE_CODE( return );
+    }
+
+    /* Normalize access type for TXF usage */
+    txf_acctype = TXF_ACCTYPE( acctype );
+
+    /*  Constrained transactions constraint #4: "The transaction's
+        storage operands access no more than four octowords. Note:
+        LOAD ON CONDITION and STORE ON CONDITION are considered to
+        reference storage regardless of the condition code."
+        (SA22-7832-12, page 5-109)
+    */
+    if (regs->txf_contran && len > (4 * ZOCTOWORD_SIZE))
+    {
+        int txf_tac = TXF_IS_FETCH_ACCTYPE() ? TAC_FETCH_OVF
+                                             : TAC_STORE_OVF;
+        regs->txf_why |= TXF_WHY_CONSTRAINT_4;
+        PTT_TXF( "*TXF mad len", txf_tac, regs->txf_contran, regs->txf_tnd );
+        ABORT_TRANS( regs, ABORT_RETRY_CC, txf_tac );
+        UNREACHABLE_CODE( return );
+    }
+
+    /* Save last translation arn */
+    regs->txf_lastarn = arn;
+
+// Copied from txf_maddr_l ; end
+// Copied from txf_maddr_l ; end
+// Copied from txf_maddr_l ; end
 
     // The transactional access about to take place may span multiple
     // cache lines within the same 4k page.
@@ -3023,6 +3077,12 @@ DLL_EXPORT void  txf_page_cache_lines_update(                    const size_t  l
             memcpy( regs->txf_backout_cache_lines[ txf_backout_cache_lines_index ].backout_cache_line,
                     maddr_cache_line, ZCACHE_LINE_SIZE) ;
             txf_backout_cache_lines_index++;
+
+            if ( TXF_ACCTYPE( acctype ) & ACC_WRITE )
+                PTT_TXF( "TXFB ma  stored", maddr_cache_line, regs->txf_tac_tnd, sysblk.txf_stats[1].txf_trans );
+            else
+                PTT_TXF( "TXFB ma fetched", maddr_cache_line, regs->txf_tac_tnd, sysblk.txf_stats[1].txf_trans );
+
         }
         maddr_cache_line += ZCACHE_LINE_SIZE;
     }
@@ -3047,7 +3107,7 @@ DLL_EXPORT void  txf_page_cache_lines_update(                    const size_t  l
                              &TXF_PAGE_CACHE_LINES_STATUS( maddr ) ) ) )
     {
 
-        // If the chache line status bits are no longer 0, then we
+        // If the cache line status bits are no longer 0, then we
         // might have a access conflict and thus needing an abort.
         if ( ( txf_page_cache_lines_status &
                TXF_PAGE_CACHE_LINES_STATUS_MASK( maddr, len ) ) != 0 )
@@ -3085,13 +3145,23 @@ DLL_EXPORT void  txf_page_cache_lines_update(                    const size_t  l
         }
     }
 
-#if 0 /* PJJ */
-#define        HHC17755 "txf_page_cache_line_update(cpu=%d,maddr=0x%16.16"PRIX64",len=%d), txf_pcls=0x%8.8X, tnd=%d, T_CPU=%d, txf=%d, a=%d, write=%d, count=%d, belated_abort=%d, size=%d, pcls_update=%d."
-        WRMSG( HHC17755, "D", regs->cpuad, (U64) maddr, (int) len, TXF_PAGE_CACHE_LINES_STATUS_MADDRL( maddr, len ),
-            regs->txf_tnd, sysblk.txf_transcpus, (int) sysblk.txf_stats[1].txf_trans, regs->txf_aborts, ( TXF_ACCTYPE( acctype ) & ACC_WRITE ) ? 1 : 0,
-            regs->txf_backout_cache_lines_count, txf_belated_abort,
-            txf_page_cache_lines_status_size, !txf_page_cache_lines_status_not_updated );
-#endif
+    if ( !txf_page_cache_lines_status_not_updated )
+    {
+        if ( TXF_ACCTYPE( acctype ) & ACC_WRITE )
+            PTT_TXF( "TXFB cl  stored", maddr, regs->txf_tac_tnd, sysblk.txf_stats[1].txf_trans );
+        else
+            PTT_TXF( "TXFB cl fetched", maddr, regs->txf_tac_tnd, sysblk.txf_stats[1].txf_trans );
+    }
+    else if ( txf_belated_abort )
+        PTT_TXF( "TXFB   conflict", maddr, regs->txf_tac_tnd, sysblk.txf_stats[1].txf_trans );
+
+#if 0  /* PJJ */
+#define    HHC17755 "txf_page_cache_line_update(cpu=%d,maddr=0x%16.16"PRIX64",len=%d), txf_pcls=0x%8.8X, tnd=%d, T_CPU=%d, txf=%d, a=%d, write=%d, count=%d, belated_abort=%d, size=%d, pcls_update=%d."
+    WRMSG( HHC17755, "D", regs->cpuad, (U64) maddr, (int) len, TXF_PAGE_CACHE_LINES_STATUS_MADDRL( maddr, len ),
+        regs->txf_tnd, sysblk.txf_transcpus, (int) sysblk.txf_stats[1].txf_trans, regs->txf_aborts, ( TXF_ACCTYPE( acctype ) & ACC_WRITE ) ? 1 : 0,
+        regs->txf_backout_cache_lines_count, txf_belated_abort,
+        txf_page_cache_lines_status_size, !txf_page_cache_lines_status_not_updated );
+#endif /* PJJ */
 
     // Hence that if by now txf_page_cache_lines_status was not updated,
     // another CPU's transaction came in between first, so we have to
@@ -3103,7 +3173,7 @@ DLL_EXPORT void  txf_page_cache_lines_update(                    const size_t  l
   #if !defined( TXF_COMMIT_METHOD )
 
         regs->txf_why |= TXF_WHY_CONFLICT;
-// PJJ  regs->txf_tnd++; // (prevent 'abort_transaction' crash)
+//PJJ   regs->txf_tnd++; // (prevent 'abort_transaction' crash)
         ABORT_TRANS( regs, ABORT_RETRY_CC, txf_tac );
         UNREACHABLE_CODE( return );
 
@@ -3177,11 +3247,11 @@ static inline TXF_BACKOUT_RESULT txf_page_cache_line_backout( REGS* regs,
     U32                txf_page_cache_lines_status,
                        txf_page_cache_lines_status_mask,
                        txf_page_cache_lines_status_stored;
-    bool               maddr_not_reset_1,
-                       maddr_not_reset_2,
-                       cache_line_not_reset,
+    bool               maddr_not_reset = FALSE,
+                       cache_line_not_reset = FALSE,
                        cache_line_is_stored,
-                       cache_line_is_shared;
+                       cache_line_is_shared = FALSE,
+                       txf_page_cache_line_status_is_fetched;
     int                txf_backout_cache_lines_count,
                        i, cpu;
     REGS*              search_regs;
@@ -3194,14 +3264,15 @@ static inline TXF_BACKOUT_RESULT txf_page_cache_line_backout( REGS* regs,
         if ( regs->txf_backout_cache_lines[ txf_backout_index ].maddr )
         {
 
-#if 1  /* PJJ */
+#define            HHC17752 "regs->txf_backout_cache_line[%d].maddr=0x%16.16"PRIX64" %s, t_cpu=%d, tnd=%d, txf=%d, %s=0x%10.10"PRIX64", txf_pcls=0x%8.8X->0x%8.8X, reset_only=%d, RC=%d."
+#if 0  /* PJJ */
         if ( !txf_reset_only && regs && regs->txf_tac != TAC_MISC )
-#define            HHC17752 "regs->txf_backout_cache_line[%d].maddr=0x%16.16"PRIX64" %s MAINSTOR=0x%16.16"PRIX64", %s=0x%10.10"PRIX64", txf_pcls=0x%8.8X->0x%8.8X, reset_only=%d, RC=%d."
             WRMSG( HHC17752, "I", txf_backout_index, (U64) regs->txf_backout_cache_lines[txf_backout_index].maddr,
-                ( ( (U64) regs->txf_backout_cache_lines[ txf_backout_index ].maddr  <  (U64) sysblk.mainstor ) |
-                  ( (U64) regs->txf_backout_cache_lines[ txf_backout_index ].maddr  >= (U64) sysblk.mainstor + sysblk.mainsize ) ) ? "outside" : "inside",
-                (U64) sysblk.mainstor, "MADDR", (U64) ( maddr - sysblk.mainstor ),
-                maddr ? TXF_PAGE_CACHE_LINES_STATUS_MADDRL( maddr, 1 ) : 0xEEEEEEEE, 0xDDDDDDDD, txf_reset_only, return_value );
+                maddr ? "MADDR NOT NULL" : "MADDR NULL",
+                sysblk.txf_transcpus, regs->txf_tnd,
+                (int) sysblk.txf_stats[1].txf_trans, "MADDR", (U64) ( maddr - sysblk.mainstor ),
+                maddr ? TXF_PAGE_CACHE_LINES_STATUS_MADDRL( maddr, 1 ) : 0xEEEEEEEE, 0xDDDDDDDD,
+                txf_reset_only + (100*cache_line_not_reset) + (10000*maddr_not_reset), return_value );
 #endif /* PJJ */
 
             // We atomically will exchange the .maddr entry with NULL provided
@@ -3211,43 +3282,44 @@ static inline TXF_BACKOUT_RESULT txf_page_cache_line_backout( REGS* regs,
             // which is unlikely so that it likely becomes a no-op.
             OBTAIN_MAINLOCK( search_regs );
             {
-            maddr_not_reset_1 = cmpxchg8( (U64*) &maddr_old, 0,
+            maddr_not_reset = cmpxchg8( (U64*) &maddr_old, 0,
                 (U64*) &regs->txf_backout_cache_lines[ txf_backout_index ].maddr ) ? FALSE : TRUE;
             }
             RELEASE_MAINLOCK( search_regs );
-            if ( maddr_not_reset_1 )
+            if ( maddr_not_reset )
             {
 
                 // In case maddr was NULL then it is normal that an exchange did not
                 // take place the first time, but now having the correct maddr_old
                 // it must work the 2nd time, unless some other backout request
-                // sneaked in before ours in which case maddr_old is now NULL.
+                // sneaked in before ours.
                 if ( !maddr && maddr_old )
                 {
                     OBTAIN_MAINLOCK( search_regs );
                     {
-                    maddr_not_reset_2 = cmpxchg8( (U64*) &maddr_old, 0,
+                    maddr_not_reset = cmpxchg8( (U64*) &maddr_old, 0,
                         (U64*) &regs->txf_backout_cache_lines[ txf_backout_index ].maddr ) ? FALSE : TRUE;
                     }
                     RELEASE_MAINLOCK( search_regs );
+                    if ( !maddr_not_reset )
+                        PTT_TXF( "TXFB ma reset 2", maddr_old, regs->txf_tac_tnd, sysblk.txf_stats[1].txf_trans );
                 }
-
-                // In case no exchange took place then another backout came in
-                // between so ours will be reported as uncuccessful.
                 else
                     return_value = TXF_BACKOUT_NONE;
             }
+            else
+                PTT_TXF( "TXFB ma reset 1", maddr_old, regs->txf_tac_tnd, sysblk.txf_stats[1].txf_trans );
 
             // If the .maddr exchange actually took place and the old .maddr was not
             // NULL, then the page cache line status bits need to be reset, and the
             // cache line may need to be backed out.  In case of a successfull
             // transaction end, no such backout is allowed, which is indicated to us
             // with the txf_reset_only flag.
-            if ( (!maddr_not_reset_1 | !maddr_not_reset_2) && maddr_old )
+            if ( !maddr_not_reset && maddr_old )
             {
-                txf_page_cache_lines_status_mask   = TXF_PAGE_CACHE_LINES_STATUS_MASK( maddr_old, 1 );
-                txf_page_cache_lines_status_stored = txf_page_cache_lines_status_mask & (
-                TXF_PAGE_CACHE_LINES_STATUS_STORED | TXF_PAGE_CACHE_LINES_STATUS_ACCESSED );
+                txf_page_cache_lines_status_mask    = TXF_PAGE_CACHE_LINES_STATUS_MASK( maddr_old, 1 );
+                txf_page_cache_lines_status_stored  = txf_page_cache_lines_status_mask & (
+                TXF_PAGE_CACHE_LINES_STATUS_STORED  | TXF_PAGE_CACHE_LINES_STATUS_ACCESSED );
 
                 // We first assume that the cache line was stored, not only because
                 // that is the most frequent case, but also because such cache line
@@ -3276,13 +3348,15 @@ static inline TXF_BACKOUT_RESULT txf_page_cache_line_backout( REGS* regs,
                 }
                 RELEASE_MAINLOCK( regs );
 
-    #if 1  /* PJJ */
-                if ( !txf_reset_only && regs && regs->txf_tac != TAC_MISC )
+#if 0  /* PJJ */
+                if ( !txf_reset_only && regs && regs->txf_tac != TAC_MISC && !cache_line_not_reset )
                     WRMSG( HHC17752, "D", txf_backout_index, (U64) regs->txf_backout_cache_lines[txf_backout_index].maddr,
-                        cache_line_not_reset ? "NOT RESET" : "IS RESET",
-                        (U64) sysblk.mainstor, "MADDR", (U64) ( maddr - sysblk.mainstor ),
-                        txf_page_cache_lines_status, TXF_PAGE_CACHE_LINES_STATUS( maddr_old ), txf_reset_only, return_value );
-    #endif /* PJJ */
+                        cache_line_not_reset ? "CL NOT RESET" : "CL IS RESET",
+                        sysblk.txf_transcpus, regs->txf_tnd,
+                        (int) sysblk.txf_stats[1].txf_trans, "MADDR_old", (U64) ( maddr_old - sysblk.mainstor ),
+                        txf_page_cache_lines_status, TXF_PAGE_CACHE_LINES_STATUS( maddr_old ),
+                        txf_reset_only + (100*cache_line_not_reset) + (10000*maddr_not_reset), return_value );
+#endif /* PJJ */
 
                 // If this cache line status reset from its stored status was successful,
                 // then we still have to backout the cache line by restoring it in
@@ -3291,37 +3365,44 @@ static inline TXF_BACKOUT_RESULT txf_page_cache_line_backout( REGS* regs,
                 // After that, we're done.
                 if ( !cache_line_not_reset )
                 {
+
+                    PTT_TXF( "TXFB cl reset 1", maddr_old, regs->txf_tac_tnd, sysblk.txf_stats[1].txf_trans );
+
                     if ( txf_reset_only )
                         return_value = TXF_BACKOUT_RESET_ONLY;
                     else
                     {
                         return_value = TXF_BACKOUT_STORE_CNF;
 
-        #if !defined( TXF_COMMIT_METHOD )
+#if !defined( TXF_COMMIT_METHOD )
 
                         memcpy( maddr_old,
                             regs->txf_backout_cache_lines[ txf_backout_index ].backout_cache_line,
                             ZCACHE_LINE_SIZE);
 
-        #else
+                        PTT_TXF( "TXFB ma backout", maddr_old, regs->txf_tac_tnd, sysblk.txf_stats[1].txf_trans );
+
+#else
 
                         // In case TXF_COMMIT_METHOD is still enabled as well, then the backout
                         // restore cannot do its job against mainstor, but could be done against
                         // the "altpage" copy.  Or rather we can very that the backout saved is
                         // indeed still equal to the "savepage" copy, as a logic verification.
 
-        #endif /* !defined( TXF_COMMIT_METHOD ) */
+#endif /* !defined( TXF_COMMIT_METHOD ) */
 
                     }
                 }
 
                 // If by now the cache line status bits are not yet reset, and the
-                // cache line status is non-zero, and there is more than one active
+                // cache line status is fetched, and there is more than one active
                 // transaction, then the rare case of a shared fetched cache line
                 // must be checked, in which case the cache line status bits reset
                 // must NOT be carried out.
-                else if ( txf_page_cache_lines_status
-                        & txf_page_cache_lines_status_mask )
+                else if ( ( txf_page_cache_lines_status
+                          & txf_page_cache_lines_status_mask ) ==
+                          ( txf_page_cache_lines_status_mask
+                          & TXF_PAGE_CACHE_LINES_STATUS_ACCESSED ) )
                 {
                     cache_line_is_shared = FALSE;
                     if ( sysblk.txf_transcpus > 1)
@@ -3348,18 +3429,56 @@ static inline TXF_BACKOUT_RESULT txf_page_cache_line_backout( REGS* regs,
                         }
                     }
 
-    #if 0  /* PJJ */
-                if ( !txf_reset_only )
-                    WRMSG( HHC17752, "V", txf_backout_index, (U64) regs->txf_backout_cache_lines[txf_backout_index].maddr,
-                        cache_line_is_shared ? "shared=1" : "shared=0",
-                        (U64) sysblk.mainstor, "MADDR", (U64) ( maddr - sysblk.mainstor ),
-                        txf_page_cache_lines_status, TXF_PAGE_CACHE_LINES_STATUS( maddr_old ), txf_reset_only, return_value );
-    #endif /* PJJ */
+                    // Shared (fetched) cache lines cannot have their status bits reset
+                    // without further ado.
+                    // Multiple transactions having fetched the same cache line all share
+                    // the same cache line status bits.  All these transactions must be
+                    // aborted together -- atomically -- which we implement in a special
+                    // manner by marking the cache line status a STORED but NOT ACCESSED !
+                    // The careful observer may verify that any further use of such cache
+                    // line by either non-transactional or transactional access will be
+                    // impossible and cause another abort attempt, possibly even before
+                    // ours is completed, but without undue interference.
+                    // But please note that this special shared cache line processing is
+                    // not allowed in the regular case of TEND or abort processing; it
+                    // is only required when a specific non-transactional store access
+                    // conflict triggers the abort of all shared cache line transactions,
+                    // which is when the input maddr is not NULL.
+                    if ( cache_line_is_shared && maddr )
+                    {
+                        txf_page_cache_line_status_is_fetched = TRUE;
+                        OBTAIN_MAINLOCK( regs );
+                        {
+                            while (1
+                                  && txf_page_cache_line_status_is_fetched
+                                  && cmpxchg4( &txf_page_cache_lines_status,
+                                            (   txf_page_cache_lines_status
+                                             & ~txf_page_cache_lines_status_mask   )
+                                          | (   txf_page_cache_lines_status_mask
+                                             &  TXF_PAGE_CACHE_LINES_STATUS_STORED ),
+                                              &TXF_PAGE_CACHE_LINES_STATUS( maddr_old ) ) ) ;
+                            {
+                                if ( ( txf_page_cache_lines_status
+                                     & txf_page_cache_lines_status_mask ) !=
+                                     ( txf_page_cache_lines_status
+                                     & txf_page_cache_lines_status_mask
+                                     & TXF_PAGE_CACHE_LINES_STATUS_ACCESSED ) )
+                                    txf_page_cache_line_status_is_fetched = FALSE;
+                            }
+                        }
+                        RELEASE_MAINLOCK( regs );
+                        if ( txf_page_cache_line_status_is_fetched )
+                        {
+                            PTT_TXF( "TXFB cl sh aipr", maddr_old, regs->txf_tac_tnd, sysblk.txf_stats[1].txf_trans );
+                            return_value = TXF_BACKOUT_OTHER;
+                        }
+                        else
+                            return_value = TXF_BACKOUT_NONE;
+                    }
 
-                    // Shared (fetched) cache lines cannot have their status bits reset.
                     // Otherwise the cache line status bit still need to be reset, again
                     // in an atomic operation preserving other page cache lines status bits.
-                    if ( !cache_line_is_shared )
+                    else if ( !cache_line_is_shared )
                     {
                         OBTAIN_MAINLOCK( regs );
                         {
@@ -3369,47 +3488,72 @@ static inline TXF_BACKOUT_RESULT txf_page_cache_line_backout( REGS* regs,
                                               &TXF_PAGE_CACHE_LINES_STATUS( maddr_old ) ) ) {};
                         }
                         RELEASE_MAINLOCK( regs );
+                        PTT_TXF( "TXFB cl nsh res", maddr_old, regs->txf_tac_tnd, sysblk.txf_stats[1].txf_trans );
+                        if ( txf_reset_only )
+                            return_value = TXF_BACKOUT_RESET_ONLY;
+                        else
+                            return_value = TXF_BACKOUT_FETCH_CNF;
                     }
-
-                    if ( txf_reset_only )
-                        return_value = TXF_BACKOUT_RESET_ONLY;
-                    else
-                        return_value = TXF_BACKOUT_FETCH_CNF;
                 }
             } /* if ( !maddr_not_reset && maddr_old ) */
 
-    #if 1  /* PJJ */
-            if ( cache_line_not_reset && !txf_reset_only && regs && regs->txf_tac != TAC_MISC )
-                WRMSG( HHC17752, "E", txf_backout_index, (U64) regs->txf_backout_cache_lines[txf_backout_index].maddr,
+#if 1  /* PJJ */
+            if ( ( ( cache_line_not_reset && !txf_reset_only && regs && regs->txf_tac != TAC_MISC )
+                && TXF_PAGE_CACHE_LINES_STATUS_MADDRL( maddr_old, 1 )
+                && ( return_value == TXF_BACKOUT_STORE_CNF || return_value == TXF_BACKOUT_FETCH_CNF ) )
+                || cache_line_is_shared )
+// PJJ          || !( !maddr_not_reset && maddr_old ) )
+            {
+                PTT_TXF( "TXFB     17738E", maddr, regs->txf_tac_tnd, sysblk.txf_stats[1].txf_trans );
+#define                HHC17738 "regs->txf_backout_cache_line[%d].maddr=0x%16.16"PRIX64" %s, t_cpu=%d, tnd=%d, (%s%02X %sTXF 0x%4.4"PRIx64") %s=0x%10.10"PRIX64", txf_pcls=0x%8.8X->0x%8.8X, reset_only=%d, RC=%d."
+                WRMSG( HHC17738, "E", txf_backout_index, (U64) regs->txf_backout_cache_lines[txf_backout_index].maddr,
                     return_value == TXF_BACKOUT_STORE_CNF ? "STORE_CNF" :
                     ( return_value == TXF_BACKOUT_FETCH_CNF ? "FETCH_CNF" : "NO_CONFLICT" ),
-                    (U64) sysblk.mainstor, "MADDR", (U64) ( maddr - sysblk.mainstor ),
+                    sysblk.txf_transcpus, regs->txf_tnd, TXF_CPUAD( regs ), TXF_QSIE( regs ),
+                    sysblk.txf_stats[1].txf_trans, "MADDR", (U64) ( maddr ),
                     txf_page_cache_lines_status, TXF_PAGE_CACHE_LINES_STATUS( maddr_old ),
-                    txf_reset_only + (100*cache_line_not_reset) + (10000*maddr_not_reset_1) + (20000*maddr_not_reset_2), return_value );
-    #endif /* PJJ */
+                    txf_reset_only + (100*cache_line_not_reset) + (10000*maddr_not_reset), return_value );
+            }
+#endif /* PJJ */
+
         } /* if ( regs->txf_backout_cache_lines[ txf_backout_index ].maddr ) */
-    }
+    } /* if ( regs ) */
 
     // The regs==NULL case is only allowed if txf_reset_only==TRUE, and will
     // merely result in the reset of the txf_page_cache_lines_status bits.
+    // We initialize the return_value on the assumoption that the reset isn't
+    // even needed, which we revise if that was a wrong assumption.
     else if (txf_reset_only )
     {
-        txf_page_cache_lines_status      = TXF_PAGE_CACHE_LINES_STATUS     ( maddr );
+        return_value = TXF_BACKOUT_NONE;
         txf_page_cache_lines_status_mask = TXF_PAGE_CACHE_LINES_STATUS_MASK( maddr, 1 );
-        OBTAIN_MAINLOCK( regs );
+        txf_page_cache_lines_status      = TXF_PAGE_CACHE_LINES_STATUS( maddr )
+                                        & ~txf_page_cache_lines_status_mask;
+//PJJ   OBTAIN_MAINLOCK( regs );
         {
             while ( cmpxchg4( &txf_page_cache_lines_status,
                                txf_page_cache_lines_status
                             & ~txf_page_cache_lines_status_mask,
-                              &TXF_PAGE_CACHE_LINES_STATUS( maddr ) ) ) {};
+                              &TXF_PAGE_CACHE_LINES_STATUS( maddr ) ) )
+            {
+                return_value = TXF_BACKOUT_RESET_ONLY;
+            }
         }
-        RELEASE_MAINLOCK( regs );
-        return_value = TXF_BACKOUT_RESET_ONLY;
-    } /* if ( regs ) */
+//PJJ   RELEASE_MAINLOCK( regs );
+
+        if ( return_value == TXF_BACKOUT_RESET_ONLY )
+            PTT_TXF( "TXFB cl reset 3", maddr, sysblk.txf_transcpus, sysblk.txf_stats[1].txf_trans );
+
+#if 0  /* PJJ */
+#define        HHC17754 "txf_page_cache_line_backout( regs==NULL, maddr=0x%2.2"PRIx64", txf_reset_only=%d), t_cpu=%d, txf=%d, RC=%d"
+        WRMSG( HHC17754, "D", (U64) maddr, txf_reset_only, sysblk.txf_transcpus, (int) sysblk.txf_stats[1].txf_trans, return_value );
+#endif /* PJJ */
+
+    }
 
     return return_value;
 
-} /* end function txf_page_cache_line_backout*/
+} /* end function txf_page_cache_line_backout */
 
 /*-------------------------------------------------------------------*/
 /*                                                                   */
@@ -3440,24 +3584,28 @@ static inline TXF_BACKOUT_RESULT txf_page_cache_line_backout( REGS* regs,
 /*            all must be backed out.                                */
 /*                                                                   */
 /*-------------------------------------------------------------------*/
-DLL_EXPORT void txf_backout_abort_cache_lines (       size_t  len,
+DLL_EXPORT void txf_backout_abort_cache_lines ( const size_t  len,
                                                 REGS*         regs,
                                                 BYTE*         maddr )
 {
+    U32                 txf_page_cache_line_status;
     int                 txf_page_cache_line_status_size;
     int                 txf_backout_cache_lines_count;
-    REGS*               search_regs;
-    BYTE*               maddr_cache_line;
+    REGS               *search_regs;
+    BYTE               *maddr_cache_line;
+    BYTE               *maddr_abort_in_progress;
     TXF_BACKOUT_RESULT  txf_backout_tac = TXF_BACKOUT_OTHER;
-    int                 i, j, k, cpu;
+    int                 txf_conflict_tac, cpu, i, j, k;
 
-#define    HHC17753 "txf_backout_abort_cache_lines(cpu=%d,maddr=0x%16.16"PRIX64",len=%d), tnd=%d, txf_pcls=0x%8.8X;&=0x%16.16"PRIX64";s=%d, t_cpu=%d, txf=%d, a=%d, count=%d, %s=%d"
+#if 0  /* PJJ */
+#define    HHC17753 "txf_backout_abort_cache_lines(cpu=%d,maddr=0x%12.12"PRIX64",len=%d), tnd=%d, txf_pcls=0x%8.8X;&=0x%16.16"PRIX64";s=%d, t_cpu=%d, txf=%d, a=%d, count=%d, %s=%d"
     if ( regs && regs->txf_tac != TAC_MISC )
         WRMSG( HHC17753, "D", regs ? regs->cpuad : -1, (U64) maddr, (int) len, regs ? regs->txf_tnd : -1,
             maddr ? TXF_PAGE_CACHE_LINES_STATUS_MADDRL( maddr, len ) : 0xAB0000ED ,
             maddr ? (U64) ( &TXF_PAGE_CACHE_LINES_STATUS( maddr ) - sysblk.txf_page_cache_lines_status ) : 0x0 ,
             maddr ? (int) TXF_PAGE_CACHE_LINES_STATUS_SIZE( maddr, len ) : 0x0 , sysblk.txf_transcpus,
             (int) sysblk.txf_stats[1].txf_trans, regs ? regs->txf_aborts : -1 , regs ? regs->txf_backout_cache_lines_count : -1, "TAC", regs->txf_tac );
+#endif /* PJJ */
 
     // SA22-7832-12 z/Architecture - Principles of Operation, pg 5-100 (top right),
     // states "A fetch-conflict / store-conflict condition is detected when another
@@ -3487,14 +3635,7 @@ DLL_EXPORT void txf_backout_abort_cache_lines (       size_t  len,
         // later.  The TXF_BACKOUT_METHOD must be made aware of this fact, which is
         // why the following flag needs to be set.
         regs->txf_backout_abort_initiated = TRUE ;
-
 #endif /* defined( TXF_COMMIT_METHOD ) */
-
-#if 0 /* PJJ */
-#define        HHC17754 "txf_backout_abort_cache_lines( maddr==NULL, len=%d), tnd=%d, t_cpu=%d, txf=%d, count=%d"
-        WRMSG( HHC17754, "D", (int) len, regs->txf_tnd, sysblk.txf_transcpus, (int) sysblk.txf_stats[1].txf_trans, regs->txf_backout_cache_lines_count );
-#endif
-
     }
 
     // For non-transactional storage access cases we will need to search all
@@ -3504,85 +3645,107 @@ DLL_EXPORT void txf_backout_abort_cache_lines (       size_t  len,
     else
     {
         txf_page_cache_line_status_size = TXF_PAGE_CACHE_LINES_STATUS_SIZE( maddr, len );
-        maddr_cache_line = (BYTE*) ( (U64) maddr & ZCACHE_LINE_ADDRMASK );
+        maddr_cache_line = (BYTE*) ( (U64) maddr & ZCACHE_LINE_ADDRMASK ) - ZCACHE_LINE_SIZE;
 
         // For each accessed cache line in this 4K page set of cache lines...
         for ( i = 0; i < txf_page_cache_line_status_size; i++ )
         {
 
-            // For each CPU actively in a transaction, begining with the last CPU
-            // having started a transation (as a performance boost as in most
-            // cases we thus find the CPU in question immediately), until found ...
-            txf_backout_tac = TXF_BACKOUT_NONE;
-            for ( j = 0; j < sysblk.maxcpu && ( txf_backout_tac == TXF_BACKOUT_NONE ); j++ )
-            {
-                cpu = (j + sysblk.txf_cpuad_recent) % sysblk.maxcpu;
-                if (1
-                    && ( search_regs = sysblk.regs[ cpu ] ) /* == IS_CPU_ONLINE */
-                    && ( search_regs->txf_tnd ) )           /* in a transaction */
-                {
-                    txf_backout_cache_lines_count = search_regs->txf_backout_cache_lines_count;
-                    // For each cache line being transactionally accessed ...
-                    for ( k = 0; k < txf_backout_cache_lines_count && ( txf_backout_tac == TXF_BACKOUT_NONE ); k++ )
-                    {
-                                                                                                                                                                                  \
-                        // Backout the transactionally accessed cache line if the maddr is in it.
-                        txf_backout_tac = txf_page_cache_line_backout( search_regs, k, maddr_cache_line, FALSE );
-                    }
-                }
-            }
-
-            // If no backout action took place, it could be that another
-            // non-transactional access conflict came in between, but we
-            // verify that the status bits are 0 by now.  If not, then
-            // we have a logic internal error !
-            if ( txf_backout_tac == TXF_BACKOUT_NONE )
-            {
-                if ( TXF_PAGE_CACHE_LINES_STATUS_MADDRL( maddr_cache_line, 1 ) )
-                {
-#define                    HHC17742 "Invalid %s status 0x%8.8X of cache line 0x%16.16"PRIX64" reset (after transaction %d)."
-                    WRMSG( HHC17742, "E",  TXF_PAGE_CACHE_LINES_STATUS_MADDRL( maddr_cache_line, 1 ) &
-                        TXF_PAGE_CACHE_LINES_STATUS_STORED ? "STORED" : "FETCHED",
-                        TXF_PAGE_CACHE_LINES_STATUS( maddr_cache_line ),
-                        (U64) ( maddr_cache_line - sysblk.mainstor ), (int) sysblk.txf_stats[1].txf_trans );
-                    txf_page_cache_line_backout( NULL, 0, maddr_cache_line, TRUE );
-                }
-            }
-
-            // After the backout, the non-transactional storage access can
-            // proceed, but the conflicting transacion needs to be aborted.
-            // This needs to be done (atomically) setting search_regs->txf-tac.
-            // The txf_backout_tac return value tells us if ithe access conflict
-            // was a fetch or a store.
-            else
-            {
-
-        // In case the TXF_COMMIT_METHOD is enabled, then at TEND - commit time
-        // the transactional access conflict will be discovered, an abort
-        // triggered, and the transactional stores NOT comitted but discarded.
-        #if !defined( TXF_COMMIT_METHOD )
-
-                txf_abort( search_regs, txf_backout_tac, regs->cpuad, TXF_WHY_CONFLICT, PTT_LOC );
-
-        #else
-
-                search_regs->txf_backout_abort_initiated = TRUE ;
-
-        #endif /* !defined( TXF_COMMIT_METHOD ) */
-
-            }
-
-            // Proceed to the next adjacent cache line status bits.
+            // Proceed to the next adjacent cache line within the same 4K page.
             maddr_cache_line += ZCACHE_LINE_SIZE;
-        }
-    }
 
+            // While the conflicting transaction hasn't ended or been aborted yet ...
+            while ( ( txf_page_cache_line_status = TXF_PAGE_CACHE_LINES_STATUS_MADDRL( maddr_cache_line, 1 ) ) )
+            {
+                txf_backout_tac = TXF_BACKOUT_NONE;
+                maddr_abort_in_progress = NULL;
+
+                // Prepare the transaction conflict abort code.
+                txf_conflict_tac = ( txf_page_cache_line_status & TXF_PAGE_CACHE_LINES_STATUS_STORED ) ?
+                    TAC_STORE_CNF : TAC_FETCH_CNF;
+
+                // For each CPU actively in a transaction, begining with the last CPU
+                // having started a transaction (as a performance boost as in most
+                // cases we thus find the CPU in question immediately), until all such
+                // CPU's have been checked.  There can be multiple transactions which
+                // have all fetched the same cache line which now all need to be aborted,
+                // but with a stored cache line there can only be one.
+                for ( j = 0; j < sysblk.maxcpu && ( txf_backout_tac != TAC_STORE_CNF ); j++ )
+                {
+                    cpu = (j + sysblk.txf_cpuad_recent) % sysblk.maxcpu;
+                    if (1
+                        && ( search_regs = sysblk.regs[ cpu ] ) /* == IS_CPU_ONLINE */
+                        && ( search_regs->txf_tnd ) )           /* in a transaction */
+                    {
+                        txf_backout_cache_lines_count = search_regs->txf_backout_cache_lines_count;
+
+                        // For each cache line being transactionally accessed ...
+                        for ( k = 0; k < txf_backout_cache_lines_count && ( txf_backout_tac == TXF_BACKOUT_NONE ); k++ )
+                        {
+
+                            // If this is the cache line to cause the abort we are searching for ?
+                            if ( search_regs->txf_backout_cache_lines[ k ].maddr == maddr_cache_line )
+                            {
+#if !defined( TXF_COMMIT_METHOD )
+
+                                // The transaction abort will always succeed unless it's already aborted or ended.
+                                txf_abort( search_regs, txf_conflict_tac, regs->cpuad, TXF_WHY_CONFLICT, PTT_LOC );
+                                if ( search_regs->txf_tnd && search_regs->txf_tac == txf_conflict_tac )
+                                {
+
+                                    // Backout the transactionally accessed cache line if the maddr matches,
+                                    // it will return TXF_BACKOUT_NONE if the maddr doesn't match.
+                                    txf_backout_tac = txf_page_cache_line_backout( search_regs, k, maddr_cache_line, FALSE );
+
+                                    if ( txf_backout_tac == TAC_FETCH_CNF )
+                                        PTT_TXF( "TXFB fetc abort", maddr_cache_line, sysblk.txf_transcpus, sysblk.txf_stats[1].txf_trans );
+                                    else if ( txf_backout_tac == TAC_STORE_CNF )
+                                        PTT_TXF( "TXFB stor abort", maddr_cache_line, sysblk.txf_transcpus, sysblk.txf_stats[1].txf_trans );
+
+                                    // If the backout was for a fetched cache line shared by multiple
+                                    // transactions, it status bits were NOT reset, but rather changed to
+                                    // the special setting of STORED but NOT ACCESSED.  We retain the maddr
+                                    // of that cache line so we can finally reset it when all transactions
+                                    // have been aborted and its txf_backout_cache_line[ ].maddr cleared.
+                                    else if ( txf_backout_tac == TXF_BACKOUT_OTHER )
+                                    {
+                                        maddr_abort_in_progress = maddr_cache_line;
+                                        PTT_TXF( "TXFB inpr abort", maddr_cache_line, sysblk.txf_transcpus, sysblk.txf_stats[1].txf_trans );
+                                    }
+                                    else
+                                        PTT_TXF( "TXFB fail abort", maddr_cache_line, sysblk.txf_transcpus, sysblk.txf_stats[1].txf_trans );
+                                }
+#else
+                                // In case the TXF_COMMIT_METHOD is enabled, then at TEND - commit time
+                                // the transactional access conflict will be discovered, an abort
+                                // triggered, and the transactional stores NOT comitted but discarded.
+                                search_regs->txf_backout_abort_initiated = TRUE ;
+#endif /* !defined( TXF_COMMIT_METHOD ) */
+                            }
+                        }
+                    }
+                } /* for ( j = 0; j < sysblk.maxcpu; j++ ) */
+
+                // In case of multiple transactions having fetched the same cache line,
+                // their shared cache line status bits can now finally be reset as well.
+                if ( maddr_abort_in_progress )
+                {
+                    txf_backout_tac = txf_page_cache_line_backout( NULL, 0, maddr_abort_in_progress, TRUE );
+                    PTT_TXF( "TXFB inpr ab OK", maddr_abort_in_progress, sysblk.txf_transcpus, sysblk.txf_stats[1].txf_trans );
+                }
+
+            } /* while ( TXF_PAGE_CACHE_LINES_STATUS_MADDRL( maddr_cache_line, 1 ) ) */
+        } /* for ( i = 0; i < txf_page_cache_line_status_size; i++ ) */
+    } /* if ( regs && regs->txf_tnd && !regs->txf_NTSTG ) */
+
+#if 0  /* PJJ */
     if ( regs && regs->txf_tac != TAC_MISC )
         WRMSG( HHC17753, "E", regs ? regs->cpuad : -1, (U64) maddr, (int) len, regs ? regs->txf_tnd : -1,
             maddr ? TXF_PAGE_CACHE_LINES_STATUS_MADDRL( maddr, len ) : 0xAB0000ED ,
             maddr ? (U64) ( &TXF_PAGE_CACHE_LINES_STATUS( maddr ) - sysblk.txf_page_cache_lines_status ) : 0x0 ,
             maddr ? (int) TXF_PAGE_CACHE_LINES_STATUS_SIZE( maddr, len ) : 0x0 , sysblk.txf_transcpus,
             (int) sysblk.txf_stats[1].txf_trans, regs ? regs->txf_aborts : -1 , regs ? regs->txf_backout_cache_lines_count : -1, "BAC", txf_backout_tac );
+#endif /* PJJ */
 
     return;
 

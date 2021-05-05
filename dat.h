@@ -137,8 +137,9 @@ static inline  BYTE* ARCH_DEP( maddr_l )
 
         // The TXF_BACKOUT_METHOD verifies any storage access to not conflict
         // with tranactional accesses on the same cache line.
-        int  txf_tac;
-        U32  txf_page_cache_lines_status_maddrl = TXF_PAGE_CACHE_LINES_STATUS_MADDRL( maddr, len );
+        int     txf_tac;
+        U32     txf_page_cache_lines_status_maddrl = TXF_PAGE_CACHE_LINES_STATUS_MADDRL( maddr, len );
+        bool    txf_page_cache_lines_status_fetched;
 
         if (0
             || ( txf_page_cache_lines_status_maddrl & TXF_PAGE_CACHE_LINES_STATUS_STORED )
@@ -151,6 +152,10 @@ static inline  BYTE* ARCH_DEP( maddr_l )
             // then needs to be aborted, which will take place thereafter.
             if ( TXF_NONTRANSACTIONAL_ACCESS( regs, arn ) )
             {
+                if ( TXF_ACCTYPE( acctype ) & ACC_WRITE )
+                    PTT_TXF( "TXFB N stor cnf", maddr, sysblk.txf_transcpus, sysblk.txf_stats[1].txf_trans );
+                else
+                    PTT_TXF( "TXFB N ftch cnf", maddr, sysblk.txf_transcpus, sysblk.txf_stats[1].txf_trans );
                 txf_backout_abort_cache_lines( len, regs, maddr );
             }
             else
@@ -209,7 +214,7 @@ static inline  BYTE* ARCH_DEP( maddr_l )
                         // precedence over the newer TXF_BACKOUT_METHOD, so access
                         // conflicts only cause transaction aborts at TEND time,
                         // when the commit is attempted but which will then fail.
-                        txf_backout_abort_cache_lines( 111, regs, NULL );
+                        txf_backout_abort_cache_lines( 1, regs, NULL );
 
     #endif /* !defined( TXF_COMMIT_METHOD ) */
 
@@ -217,25 +222,40 @@ static inline  BYTE* ARCH_DEP( maddr_l )
                 } /* if ( sysblk.txf_transcpus > 1 ) */
 
                 // If the number of CPU's in a transaction is one or if we are the
-                // cache line user, but that cache line status is not yet stored.
-                // then we still have to update that status to stored.
+                // cache line user, but that cache line status is not yet stored
+                // (which implies that we're now trying to store into that cache line),
+                // then we still have to update that status to stored.  Unless of
+                // course the status of that cache line has been changed in the
+                // mean time so that it's no longer just fetch accessed.
                 if (1
                     && !( txf_page_cache_lines_status_maddrl & TXF_PAGE_CACHE_LINES_STATUS_STORED )
                     &&  (0
                         || sysblk.txf_transcpus == 1
                         || txf_cache_line_in_use ) )
                 {
+                    txf_page_cache_lines_status_fetched = TRUE;
 
                     // MAINLOCK may be required if cmpxchg assists are unavailable
                     // which is unlikely and which then becomes a no-op.
                     OBTAIN_MAINLOCK( regs );
                     {
-                        while ( cmpxchg4( &txf_page_cache_lines_status_maddrl,
-                                           txf_page_cache_lines_status_maddrl |
-                                           TXF_PAGE_CACHE_LINES_STATUS_TO_MERGE( maddr, len, ACC_WRITE ),
-                                          &TXF_PAGE_CACHE_LINES_STATUS( maddr ) ) ) {};
+                        while (1
+                              && txf_page_cache_lines_status_fetched
+                              && cmpxchg4( &txf_page_cache_lines_status_maddrl,
+                                            txf_page_cache_lines_status_maddrl |
+                                            TXF_PAGE_CACHE_LINES_STATUS_TO_MERGE( maddr, len, ACC_WRITE ),
+                                           &TXF_PAGE_CACHE_LINES_STATUS( maddr ) ) )
+                        {
+                        if( txf_page_cache_lines_status_maddrl != ( TXF_PAGE_CACHE_LINES_STATUS_MASK( maddr, len )
+                                                                  & TXF_PAGE_CACHE_LINES_STATUS_ACCESSED ) )
+                            txf_page_cache_lines_status_fetched = FALSE;
+                        }
                     }
                     RELEASE_MAINLOCK( regs );
+                    if ( txf_page_cache_lines_status_fetched )
+                        PTT_TXF( "TXFB cl up stor", maddr, regs->txf_tac_tnd, sysblk.txf_stats[1].txf_trans );
+                    else
+                        PTT_TXF( "TXFB cl chg nop", maddr, regs->txf_tac_tnd, sysblk.txf_stats[1].txf_trans );
                 }
             } /* if ( TXF_NONTRANSACTIONAL_ACCESS( regs, arn ) ) */
         }
@@ -246,7 +266,7 @@ static inline  BYTE* ARCH_DEP( maddr_l )
         // store operations if the need would arise due to a conflict later on.
         else if ( !TXF_NONTRANSACTIONAL_ACCESS( regs, arn ) )
         {
-            txf_page_cache_lines_update( len, regs, acctype, maddr );
+            txf_page_cache_lines_update( len, arn, regs, acctype, maddr );
         }
 
     #if defined( TXF_COMMIT_METHOD )

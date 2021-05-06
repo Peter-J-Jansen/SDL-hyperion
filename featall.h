@@ -50,7 +50,7 @@
 #define OPTION_NO_E3_OPTINST            // Problematic!
 
 #define TXF_BACKOUT_METHOD              // TXF alternative implementation
-#define TXF_COMMIT_METHOD               // TXF original implementation
+//#define TXF_COMMIT_METHOD               // TXF original implementation
 
 #if  defined( TXF_NO_BACKOUT_METHOD ) && defined( TXF_NO_COMMIT_METHOD )
   #error Both TXF_NO_BACKOUT_METHOD and TXF_NO_COMMIT_METHOD are specified, the latter will be ignored.

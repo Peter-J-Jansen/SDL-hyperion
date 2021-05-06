@@ -137,7 +137,6 @@ static inline  BYTE* ARCH_DEP( maddr_l )
 
         // The TXF_BACKOUT_METHOD verifies any storage access to not conflict
         // with tranactional accesses on the same cache line.
-        int     txf_tac;
         U32     txf_page_cache_lines_status_maddrl = TXF_PAGE_CACHE_LINES_STATUS_MADDRL( maddr, len );
         bool    txf_page_cache_lines_status_fetched;
 

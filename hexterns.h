@@ -278,12 +278,14 @@ int servc_hresume(void *file);
 
 #if defined( _FEATURE_073_TRANSACT_EXEC_FACILITY )
 /* Functions in module transact.c */
+#if defined( TXF_BACKOUT_METHOD )
 TRANS_DLL_IMPORT void  txf_page_cache_lines_update(     const size_t  len,
-                                    const int  arn,     REGS*         regs,
-                                    const int  acctype, BYTE*         maddr );
+                                    const int  arn,     REGS         *regs,
+                                    const int  acctype, BYTE         *maddr );
 TRANS_DLL_IMPORT void  txf_backout_abort_cache_lines(   const size_t  len,
-                                                        REGS*         regs,
-                                                        BYTE*         maddr );
+                                                        REGS         *regs,
+                                                        BYTE         *maddr );
+#endif /* defined( TXF_BACKOUT_METHOD ) */
 TRANS_DLL_IMPORT BYTE* txf_maddr_l( const U64  vaddr,   const size_t  len,
                                     const int  arn,     REGS*         regs,
                                     const int  acctype, BYTE*         maddr );

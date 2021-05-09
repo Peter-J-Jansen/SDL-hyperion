@@ -152,10 +152,10 @@ static inline  BYTE* ARCH_DEP( maddr_l )
             // then needs to be aborted, which will take place thereafter.
             if ( TXF_NONTRANSACTIONAL_ACCESS( regs, arn ) )
             {
-                if ( TXF_ACCTYPE( acctype ) & ACC_WRITE )
-                    PTT_TXF( "TXFB N stor cnf", maddr, sysblk.txf_transcpus, sysblk.txf_stats[1].txf_trans );
+                if ( txf_page_cache_lines_status_maddrl & TXF_PAGE_CACHE_LINES_STATUS_STORED )
+                    PTT_TXF( "TXFB N stor cnf", maddr, txf_page_cache_lines_status_maddrl, sysblk.txf_stats[1].txf_trans );
                 else
-                    PTT_TXF( "TXFB N ftch cnf", maddr, sysblk.txf_transcpus, sysblk.txf_stats[1].txf_trans );
+                    PTT_TXF( "TXFB N ftch cnf", maddr, txf_page_cache_lines_status_maddrl, sysblk.txf_stats[1].txf_trans );
                 txf_backout_abort_cache_lines( len, regs, maddr );
             }
             else
